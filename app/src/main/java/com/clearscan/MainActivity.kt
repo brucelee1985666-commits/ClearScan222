@@ -523,6 +523,7 @@ data class UiState(
     val captureMessage: String? = null,
     val settings: AppSettings = AppSettings(),
     val busy: Boolean = false,
+    val documentsReady: Boolean = false,
 )
 
 class ClearScanViewModel(application: Application) : AndroidViewModel(application) {
@@ -567,9 +568,16 @@ class ClearScanViewModel(application: Application) : AndroidViewModel(applicatio
             ),
     )
 
-    val ui: StateFlow<UiState> = combine(dao.observeDocuments(), dao.observeFolders(), settingsFlow, queryFlow, navFlow) { docs, folders, settings, query, nav ->
-        allDocuments = docs
-        val visibleDocs = docs.filter { document ->
+    val ui: StateFlow<UiState> = combine(
+        dao.observeDocuments(),
+        dao.observeFolders(),
+        settingsFlow,
+        queryFlow,
+        navFlow,
+    ) { docs, folders, settings, query, nav ->
+        val availableDocs = if (nav.documentsReady) docs else emptyList()
+        allDocuments = availableDocs
+        val visibleDocs = availableDocs.filter { document ->
             val matchesQuery = document.title.contains(query, ignoreCase = true)
             matchesQuery && (query.isNotBlank() || document.folderId == nav.currentFolderId)
         }
@@ -585,8 +593,21 @@ class ClearScanViewModel(application: Application) : AndroidViewModel(applicatio
         AppLogger.init(application)
         AppLogger.i("ViewModel", "ClearScanViewModel created")
         refreshTranslationModelState()
+        navFlow.value = navFlow.value.copy(busy = true)
         viewModelScope.launch {
             settingsFlow.value = settingsRepository.load(settingsFlow.value)
+            val migrationFailures = migrateLegacyPrivateDocuments()
+            navFlow.value = navFlow.value.copy(
+                busy = false,
+                documentsReady = true,
+                captureMessage = if (migrationFailures > 0) {
+                    tr(
+                        settingsFlow.value,
+                        "Some legacy files could not be encrypted yet ($migrationFailures). Keep this app data intact and retry after freeing storage.",
+                        "部分旧文件暂时无法加密（$migrationFailures）。请保留应用数据并释放存储空间后重试。",
+                    )
+                } else navFlow.value.captureMessage,
+            )
             val session = withContext(Dispatchers.IO) { dao.latestSession() }
             if (session != null) {
                 val pages = withContext(Dispatchers.IO) { dao.draftPages(session.id) }
@@ -602,6 +623,38 @@ class ClearScanViewModel(application: Application) : AndroidViewModel(applicatio
             }
             seedIfEmpty()
         }
+    }
+
+    private suspend fun migrateLegacyPrivateDocuments(): Int = withContext(Dispatchers.IO) {
+        val paths = linkedSetOf<String>()
+        val documents = dao.observeDocuments().first()
+        documents.forEach { document ->
+            paths += document.thumbnailPath
+            paths += document.exportPath
+            dao.pages(document.id).forEach { page ->
+                paths += page.originalPath
+                paths += page.processedPath
+            }
+        }
+        dao.allDraftPages().forEach { page ->
+            paths += page.originalPath
+            paths += page.processedPath
+            paths += page.thumbnailPath
+        }
+
+        var failures = 0
+        paths.filter { it.isNotBlank() }.forEach { path ->
+            val file = File(path)
+            if (file.isFile && !DocumentCrypto.isEncrypted(file)) {
+                runCatching { DocumentCrypto.encryptInPlace(file) }
+                    .onFailure {
+                        failures++
+                        AppLogger.e("Security", "Unable to migrate one legacy document file", it)
+                    }
+            }
+        }
+        AppLogger.i("Security", "Legacy document migration completed; failures=$failures")
+        failures
     }
 
     private fun go(screen: Screen, update: UiState.() -> UiState = { this }) {
@@ -861,6 +914,9 @@ class ClearScanViewModel(application: Application) : AndroidViewModel(applicatio
             val original = File(sessionDir, "$pageId-original.jpg")
             if (pageBitmaps.size == 1 && sourceFile != null && sourceFile.exists()) {
                 sourceFile.copyTo(original, overwrite = true)
+                // Camera capture staging files are transient plaintext; persisted scan pages are encrypted.
+                DocumentCrypto.encryptInPlace(original)
+                sourceFile.delete()
             } else {
                 ImageProcessor.writeJpeg(pageBitmap, original, 88)
             }
@@ -1237,15 +1293,19 @@ class ClearScanViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun openDocument(document: Document) {
         AppLogger.i("Document", "Open document id=${document.id} title=${document.title} type=${document.type}")
-        val bitmap = ImageProcessor.readBitmap(document.thumbnailPath, 3072)
-        go(Screen.Detail) {
-            copy(
-            selected = document,
-            tab = Tab.Docs,
-            scanBitmap = bitmap,
-            processedBitmap = bitmap,
-            savedResultDetail = false,
-            )
+        viewModelScope.launch {
+            val bitmap = withContext(Dispatchers.IO) {
+                ImageProcessor.readBitmap(document.thumbnailPath, 3072)
+            }
+            go(Screen.Detail) {
+                copy(
+                    selected = document,
+                    tab = Tab.Docs,
+                    scanBitmap = bitmap,
+                    processedBitmap = bitmap,
+                    savedResultDetail = false,
+                )
+            }
         }
     }
 
@@ -1383,11 +1443,18 @@ class ClearScanViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun setDocumentPassword(documentId: Long, password: String) {
-        AppLogger.i("Security", if (password.isBlank()) "Remove password for document $documentId" else "Set password for document $documentId")
-        val current = settingsFlow.value.passwordMap
-        settingsFlow.value = settingsFlow.value.copy(passwordMap = if (password.isBlank()) current - documentId else current + (documentId to password))
+        // The old feature only stored a plaintext string and did not encrypt or gate document access.
+        // It is intentionally disabled rather than presenting a false security guarantee.
+        settingsFlow.value = settingsFlow.value.copy(passwordMap = emptyMap())
+        prefs.edit().remove("passwords").apply()
         saveSettings(settingsFlow.value)
-        navFlow.value = navFlow.value.copy(captureMessage = if (password.isBlank()) tr(settingsFlow.value, "Password removed", "密码已移除") else tr(settingsFlow.value, "Password set", "密码已设置"))
+        navFlow.value = navFlow.value.copy(
+            captureMessage = tr(
+                settingsFlow.value,
+                "Legacy password locks were removed. Documents are encrypted on this device; password-based vaults are not yet available.",
+                "旧密码锁已移除。文档现已在此设备上加密；基于密码的保险库功能暂不可用。",
+            ),
+        )
     }
 
     fun runTool(name: String) {
@@ -1783,6 +1850,9 @@ class ClearScanViewModel(application: Application) : AndroidViewModel(applicatio
             }
             if (result != null) {
                 AppLogger.i("Tool", "$tool complete outputId=${result.id} path=${result.exportPath}")
+                val resultThumbnail = withContext(Dispatchers.IO) {
+                    ImageProcessor.readBitmap(result.thumbnailPath)
+                }
                 replace(Screen.Detail) {
                     copy(
                         busy = false,
@@ -1790,8 +1860,8 @@ class ClearScanViewModel(application: Application) : AndroidViewModel(applicatio
                         tab = Tab.Docs,
                         activeTool = null,
                         selectedToolIds = emptySet(),
-                        scanBitmap = ImageProcessor.readBitmap(result.thumbnailPath),
-                        processedBitmap = ImageProcessor.readBitmap(result.thumbnailPath),
+                        scanBitmap = resultThumbnail,
+                        processedBitmap = resultThumbnail,
                         captureMessage = "${toolLabel(tool, settingsFlow.value)} ${if (settingsFlow.value.language == "中文") "已完成" else "complete"}",
                     )
                 }
@@ -1930,21 +2000,15 @@ class ClearScanViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     private fun loadSettings(): AppSettings {
-        val passwords = prefs.getString("passwords", "").orEmpty()
-            .split("|")
-            .mapNotNull { item ->
-                val parts = item.split(":", limit = 2)
-                parts.firstOrNull()?.toLongOrNull()?.let { id -> id to parts.getOrElse(1) { "" } }
-            }
-            .filter { it.second.isNotBlank() }
-            .toMap()
+        // Purge legacy plaintext passwords before loading any other preferences.
+        prefs.edit().remove("passwords").apply()
         return AppSettings(
             language = prefs.getString("language", "English") ?: "English",
             theme = prefs.getString("theme", "Light") ?: "Light",
             loggedIn = prefs.getBoolean("loggedIn", false),
             accountName = prefs.getString("accountName", "Guest") ?: "Guest",
             accountEmail = prefs.getString("accountEmail", "") ?: "",
-            passwordMap = passwords,
+            passwordMap = emptyMap(),
             defaultSavePath = prefs.getString("defaultSavePath", "Internal Storage") ?: "Internal Storage",
             autoCheckUpdates = prefs.getBoolean("autoCheckUpdates", true),
             autoDownloadUpdates = prefs.getBoolean("autoDownloadUpdates", true),
@@ -1969,13 +2033,16 @@ class ClearScanViewModel(application: Application) : AndroidViewModel(applicatio
             .putBoolean("cameraGrid", settings.cameraGrid)
             .putBoolean("cameraEnhance", settings.cameraEnhance)
             .putString("cameraResolution", settings.cameraResolution)
-            .putString("passwords", settings.passwordMap.entries.joinToString("|") { "${it.key}:${it.value}" })
+            .remove("passwords")
             .apply()
         viewModelScope.launch(Dispatchers.IO) { settingsRepository.save(settings) }
     }
 
     private suspend fun seedIfEmpty() {
-        if (ui.value.documents.isNotEmpty()) return
+        val hasDocuments = withContext(Dispatchers.IO) {
+            dao.observeDocuments().first().isNotEmpty()
+        }
+        if (hasDocuments) return
         val context = getApplication<Application>()
         val names = listOf("Contract Agreement" to "PDF", "Lecture Notes" to "PDF", "Invoice_0528" to "PDF", "ID Card" to "JPG", "Book Summary" to "PDF", "Whiteboard Notes" to "JPG")
         names.forEachIndexed { index, pair ->
@@ -2275,9 +2342,13 @@ fun DocumentRow(document: Document, model: ClearScanViewModel) {
 
 @Composable
 fun Thumbnail(path: String, modifier: Modifier = Modifier) {
-    val bitmap = remember(path) { ImageProcessor.readBitmap(path, 256) }
-    if (bitmap != null) {
-        Image(bitmap.asImageBitmap(), null, modifier.clip(RoundedCornerShape(5.dp)).background(Soft), contentScale = ContentScale.Crop)
+    var bitmap by remember(path) { mutableStateOf<Bitmap?>(null) }
+    LaunchedEffect(path) {
+        bitmap = withContext(Dispatchers.IO) { ImageProcessor.readBitmap(path, 256) }
+    }
+    val currentBitmap = bitmap
+    if (currentBitmap != null) {
+        Image(currentBitmap.asImageBitmap(), null, modifier.clip(RoundedCornerShape(5.dp)).background(Soft), contentScale = ContentScale.Crop)
     } else {
         Box(modifier.clip(RoundedCornerShape(5.dp)).background(Soft), contentAlignment = Alignment.Center) {
             Icon(Icons.Default.Description, null, tint = Muted)
@@ -3261,7 +3332,7 @@ fun DetailScreen(state: UiState, model: ClearScanViewModel) {
             EditTool(tr(state.settings, "Share", "分享"), Icons.Default.Share, model::shareSelected)
             EditTool(tr(state.settings, "Edit", "编辑"), Icons.Default.Edit) { model.toEdit() }
             EditTool(tr(state.settings, "Print", "打印"), Icons.Default.Print) { printDocument(context, doc) }
-            EditTool(if (state.settings.passwordMap.containsKey(doc.id)) tr(state.settings, "Locked", "已锁定") else tr(state.settings, "Password", "密码"), Icons.Default.Lock) { passwordOpen = true }
+            EditTool(tr(state.settings, "Encrypted on device", "已在设备上加密"), Icons.Default.Lock) { }
             EditTool(tr(state.settings, "Delete", "删除"), Icons.Default.Delete, model::deleteSelected)
         }
         TextButton(onClick = { moveOpen = true }, modifier = Modifier.align(Alignment.CenterHorizontally)) { Text(tr(state.settings, "Move to folder", "移动到文件夹")) }
@@ -3721,7 +3792,7 @@ fun SettingsScreen(state: UiState, model: ClearScanViewModel, embedded: Boolean 
         item { SettingRow(label = tr(settings, "Language", "语言"), icon = Icons.Default.Language, value = settings.language, onClick = { activeDialog = "language" }) }
         item { SettingRow(label = tr(settings, "Theme", "主题"), icon = Icons.Default.Brightness6, value = tr(settings, settings.theme, if (settings.theme == "Light") "日间" else "夜间"), onClick = { activeDialog = "theme" }) }
         item { SettingRow(label = tr(settings, "Default Save Path", "默认保存路径"), icon = Icons.Default.Folder, value = settings.defaultSavePath, onClick = { activeDialog = "path" }) }
-        item { SettingRow(label = tr(settings, "Password Lock", "文件密码锁"), icon = Icons.Default.Lock, value = tr(settings, "${settings.passwordMap.size} protected", "已保护 ${settings.passwordMap.size} 个文件"), onClick = { activeDialog = "password" }) }
+        item { SettingRow(label = tr(settings, "Document encryption", "文档加密"), icon = Icons.Default.Lock, value = "AES-256-GCM · Android Keystore", onClick = { }) }
         item {
             Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface), shape = RoundedCornerShape(8.dp)) {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -3929,7 +4000,7 @@ fun LegalScreen(state: UiState, model: ClearScanViewModel) {
         item {
             Text(
                 if (privacy) {
-                    tr(settings, "ClearScan stores scans, passwords, account profile data, and settings locally on this device. Files are not uploaded to a server in this clean local edition. Camera and media permissions are used only for scanning, importing, exporting, sharing, and printing documents. You can delete documents from the Docs page and clear local account state with Log Out.", "ClearScan 会将扫描文件、密码、账号资料和设置保存在本设备本地。纯净本地版不会把文件上传到服务器。相机和媒体权限仅用于扫描、导入、导出、分享和打印文档。你可以在文档页删除文件，也可以通过退出登录清除本地账号状态。")
+                    tr(settings, "ClearScan stores scans and settings locally. Private document files are encrypted with AES-256-GCM using Android Keystore. Photos are not sent to a ClearScan server; files leave the app only after an explicit export or share action. Camera and media access are used for scanning, importing, exporting, sharing, and printing.", "ClearScan 将扫描文件和设置保存在本地。私有文档使用 Android Keystore 和 AES-256-GCM 加密。照片不会发送到 ClearScan 服务器；文件仅在明确导出或分享时离开应用。相机和媒体访问仅用于扫描、导入、导出、分享和打印。")
                 } else {
                     tr(settings, "ClearScan is provided as a local document scanning tool. You are responsible for the content you scan, export, share, or print. PDF tools create new local files and do not modify originals unless you delete them. Password protection is local to this app and should not be treated as enterprise encryption. By using the app, you agree to use it lawfully and keep backups of important documents.", "ClearScan 是一个本地文档扫描工具。你需要对自己扫描、导出、分享或打印的内容负责。PDF 工具会生成新的本地文件，不会覆盖原文件，除非你主动删除。文件密码保护仅在本应用内本地生效，不应视为企业级加密。使用本应用即表示你同意合法使用，并自行备份重要文档。")
                 },
@@ -4128,6 +4199,32 @@ fun buildHyMt2Prompt(input: String, sourceLang: String, targetLang: String): Str
 }
 
 object ImageProcessor {
+    private lateinit var appContext: Context
+
+    fun initialize(context: Context) {
+        appContext = context.applicationContext
+    }
+
+    private fun <T> withReadableFile(file: File, block: (File) -> T): T {
+        val context = appContext
+        var result: T? = null
+        DocumentCrypto.withPlaintextFile(context, file) { plaintext -> result = block(plaintext) }
+        @Suppress("UNCHECKED_CAST")
+        return result as T
+    }
+
+    private fun writeEncrypted(file: File, writer: (File) -> Unit) {
+        val context = appContext
+        file.parentFile?.mkdirs()
+        val plaintext = File(context.cacheDir, "clear-write-${java.util.UUID.randomUUID()}.tmp")
+        try {
+            writer(plaintext)
+            DocumentCrypto.encryptFile(plaintext, file)
+        } finally {
+            plaintext.delete()
+        }
+    }
+
     fun sampleDocumentBitmap(title: String = "AGREEMENT"): Bitmap {
         val bitmap = Bitmap.createBitmap(900, 1250, Bitmap.Config.ARGB_8888)
         val canvas = AndroidCanvas(bitmap)
@@ -4159,32 +4256,35 @@ object ImageProcessor {
         return bitmap
     }
 
-    fun readBitmap(path: String): Bitmap? = runCatching { BitmapFactoryCompat.decode(path) }.getOrNull()
+    fun readBitmap(path: String): Bitmap? = runCatching {
+        withReadableFile(File(path)) { BitmapFactoryCompat.decode(it.absolutePath) }
+    }.onFailure { AppLogger.e("Image", "Failed to decode bitmap", it) }.getOrNull()
 
     fun readBitmap(path: String, maxDimension: Int): Bitmap? = runCatching {
-        BitmapFactoryCompat.decodeSampled(path, maxDimension)
-    }.onFailure { AppLogger.e("Image", "Failed to decode sampled bitmap: $path", it) }.getOrNull()
+        withReadableFile(File(path)) { BitmapFactoryCompat.decodeSampled(it.absolutePath, maxDimension) }
+    }.onFailure { AppLogger.e("Image", "Failed to decode sampled bitmap", it) }.getOrNull()
 
     fun renderPdfFirstPage(path: String): Bitmap? = renderPdfPages(path, maxPages = 1).firstOrNull()
 
     fun renderPdfPages(path: String, maxPages: Int = Int.MAX_VALUE): List<Bitmap> = runCatching {
-        val file = File(path)
-        if (!file.exists()) return@runCatching emptyList()
-        ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY).use { descriptor ->
-            android.graphics.pdf.PdfRenderer(descriptor).use { renderer ->
-                val pages = mutableListOf<Bitmap>()
-                val count = minOf(renderer.pageCount, maxPages)
-                for (index in 0 until count) {
-                    renderer.openPage(index).use { page ->
-                        val scale = 2
-                        val bitmap = Bitmap.createBitmap(page.width * scale, page.height * scale, Bitmap.Config.ARGB_8888)
-                        val canvas = AndroidCanvas(bitmap)
-                        canvas.drawColor(Color.WHITE)
-                        page.render(bitmap, null, null, android.graphics.pdf.PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
-                        pages += bitmap
+        withReadableFile(File(path)) { file ->
+            if (!file.exists()) return@withReadableFile emptyList()
+            ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY).use { descriptor ->
+                android.graphics.pdf.PdfRenderer(descriptor).use { renderer ->
+                    val pages = mutableListOf<Bitmap>()
+                    val count = minOf(renderer.pageCount, maxPages)
+                    for (index in 0 until count) {
+                        renderer.openPage(index).use { page ->
+                            val scale = 2
+                            val bitmap = Bitmap.createBitmap(page.width * scale, page.height * scale, Bitmap.Config.ARGB_8888)
+                            val canvas = AndroidCanvas(bitmap)
+                            canvas.drawColor(Color.WHITE)
+                            page.render(bitmap, null, null, android.graphics.pdf.PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                            pages += bitmap
+                        }
                     }
+                    pages
                 }
-                pages
             }
         }
     }.getOrDefault(emptyList())
@@ -4245,12 +4345,12 @@ object ImageProcessor {
         val decoded = decodeCameraBitmap(input.absolutePath, maxDimension) ?: return@runCatching null
         var encoded = decoded
         for (quality in listOf(88, 82, 76)) {
-            writeJpeg(encoded, output, quality)
+            writeJpegTemporary(encoded, output, quality)
             if (output.length() <= targetBytes) break
         }
         if (output.length() > targetBytes && maxOf(decoded.width, decoded.height) > 2400) {
             encoded = previewBitmap(decoded, 2400) ?: decoded
-            writeJpeg(encoded, output, 80)
+            writeJpegTemporary(encoded, output, 80)
         }
         if (!output.exists() || output.length() <= 0L) return@runCatching null
         val originalBytes = input.length()
@@ -4290,36 +4390,42 @@ object ImageProcessor {
         writeJpeg(bitmap, file, percent)
     }
 
-    fun writeJpeg(bitmap: Bitmap, file: File, quality: Int) {
+    private fun writeJpegTemporary(bitmap: Bitmap, file: File, quality: Int) {
         file.parentFile?.mkdirs()
         FileOutputStream(file).use { out ->
             check(bitmap.compress(Bitmap.CompressFormat.JPEG, quality.coerceIn(40, 95), out)) { "JPEG encoding failed" }
         }
     }
 
+    fun writeJpeg(bitmap: Bitmap, file: File, quality: Int) {
+        writeEncrypted(file) { plaintext -> writeJpegTemporary(bitmap, plaintext, quality) }
+    }
+
     fun writePng(bitmap: Bitmap, file: File) {
-        file.parentFile?.mkdirs()
-        FileOutputStream(file).use { out ->
-            bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+        writeEncrypted(file) { plaintext ->
+            FileOutputStream(plaintext).use { out ->
+                check(bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)) { "PNG encoding failed" }
+            }
         }
     }
 
     @Suppress("DEPRECATION")
     fun writeWebp(bitmap: Bitmap, file: File, quality: Int = 88) {
-        file.parentFile?.mkdirs()
-        FileOutputStream(file).use { out ->
-            val format = if (android.os.Build.VERSION.SDK_INT >= 30) Bitmap.CompressFormat.WEBP_LOSSY else Bitmap.CompressFormat.WEBP
-            check(bitmap.compress(format, quality.coerceIn(40, 95), out)) { "WebP encoding failed" }
+        writeEncrypted(file) { plaintext ->
+            FileOutputStream(plaintext).use { out ->
+                val format = if (android.os.Build.VERSION.SDK_INT >= 30) Bitmap.CompressFormat.WEBP_LOSSY else Bitmap.CompressFormat.WEBP
+                check(bitmap.compress(format, quality.coerceIn(40, 95), out)) { "WebP encoding failed" }
+            }
         }
     }
 
     fun writeBmp(bitmap: Bitmap, file: File) {
-        file.parentFile?.mkdirs()
+        writeEncrypted(file) { plaintext ->
         val width = bitmap.width
         val height = bitmap.height
         val rowSize = ((width * 3 + 3) / 4) * 4
         val pixelBytes = rowSize * height
-        FileOutputStream(file).buffered().use { out ->
+        FileOutputStream(plaintext).buffered().use { out ->
             fun writeLe16(value: Int) {
                 out.write(value and 0xFF)
                 out.write((value ushr 8) and 0xFF)
@@ -4360,6 +4466,7 @@ object ImageProcessor {
                 out.write(row)
             }
         }
+        }
     }
 
     fun writePdf(bitmap: Bitmap, file: File) {
@@ -4367,18 +4474,22 @@ object ImageProcessor {
     }
 
     fun writePdf(bitmaps: List<Bitmap>, file: File) {
-        file.parentFile?.mkdirs()
-        val pdf = PdfDocument()
-        bitmaps.forEachIndexed { index, bitmap ->
-            val pageInfo = PdfDocument.PageInfo.Builder(595, 842, index + 1).create()
-            val page = pdf.startPage(pageInfo)
-            val rect = RectF(32f, 32f, 563f, 810f)
-            page.canvas.drawColor(Color.WHITE)
-            page.canvas.drawBitmap(bitmap, null, rect, Paint(Paint.ANTI_ALIAS_FLAG))
-            pdf.finishPage(page)
+        writeEncrypted(file) { plaintext ->
+            val pdf = PdfDocument()
+            try {
+                bitmaps.forEachIndexed { index, bitmap ->
+                    val pageInfo = PdfDocument.PageInfo.Builder(595, 842, index + 1).create()
+                    val page = pdf.startPage(pageInfo)
+                    val rect = RectF(32f, 32f, 563f, 810f)
+                    page.canvas.drawColor(Color.WHITE)
+                    page.canvas.drawBitmap(bitmap, null, rect, Paint(Paint.ANTI_ALIAS_FLAG))
+                    pdf.finishPage(page)
+                }
+                FileOutputStream(plaintext).use { pdf.writeTo(it) }
+            } finally {
+                pdf.close()
+            }
         }
-        FileOutputStream(file).use { pdf.writeTo(it) }
-        pdf.close()
     }
 
     fun rotate(bitmap: Bitmap): Bitmap {
@@ -4689,50 +4800,74 @@ fun shareFile(
     targetPackage: String? = null,
     chooserTitle: String = "Share ${doc.title}",
 ) {
-    val file = File(doc.exportPath)
-    if (!file.exists()) {
-        Toast.makeText(context, localized(context, "File is no longer available", "文件已不存在"), Toast.LENGTH_SHORT).show()
-        AppLogger.w("Share", "Missing file for document ${doc.id}: ${doc.exportPath}")
-        return
-    }
-    val uri = FileProvider.getUriForFile(context, "${context.packageName}.provider", file)
-    val intent = Intent(Intent.ACTION_SEND).apply {
-        type = mimeTypeFor(doc.type)
-        putExtra(Intent.EXTRA_STREAM, uri)
-        putExtra(Intent.EXTRA_TITLE, doc.title)
-        putExtra(Intent.EXTRA_SUBJECT, doc.title)
-        clipData = ClipData.newUri(context.contentResolver, doc.title, uri)
-        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        if (targetPackage != null) setPackage(targetPackage)
-    }
-    runCatching {
-        if (targetPackage != null) {
-            context.grantUriPermission(targetPackage, uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
+        val file = runCatching { DocumentCrypto.decryptedCacheCopy(context, File(doc.exportPath)) }
+            .getOrElse {
+                AppLogger.e("Share", "Unable to prepare decrypted document for explicit sharing", it)
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(context, localized(context, "Unable to prepare document", "无法准备文档"), Toast.LENGTH_SHORT).show()
+                }
+                return@launch
+            }
+        if (!file.exists()) {
+            withContext(Dispatchers.Main) {
+                Toast.makeText(context, localized(context, "File is no longer available", "文件已不存在"), Toast.LENGTH_SHORT).show()
+            }
+            AppLogger.w("Share", "Missing file for document ${doc.id}: ${doc.exportPath}")
+            return@launch
         }
-        context.startActivity(Intent.createChooser(intent, chooserTitle))
-        AppLogger.i("Share", "Share document ${doc.id} target=${targetPackage ?: "system"} mime=${intent.type}")
-    }.onFailure { error ->
-        AppLogger.e("Share", "Unable to share to ${targetPackage ?: "system"}", error)
-        if (targetPackage != null) {
-            Toast.makeText(context, localized(context, "Target app is unavailable. Opening system share.", "目标应用不可用，正在打开系统分享"), Toast.LENGTH_SHORT).show()
-            shareFile(context, doc, targetPackage = null, chooserTitle = chooserTitle)
-        } else {
-            Toast.makeText(context, localized(context, "No compatible sharing app found", "未找到可用的分享应用"), Toast.LENGTH_SHORT).show()
+        val uri = FileProvider.getUriForFile(context, "${context.packageName}.provider", file)
+        val intent = Intent(Intent.ACTION_SEND).apply {
+            type = mimeTypeFor(doc.type)
+            putExtra(Intent.EXTRA_STREAM, uri)
+            putExtra(Intent.EXTRA_TITLE, doc.title)
+            putExtra(Intent.EXTRA_SUBJECT, doc.title)
+            clipData = ClipData.newUri(context.contentResolver, doc.title, uri)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            if (targetPackage != null) setPackage(targetPackage)
+        }
+        withContext(Dispatchers.Main) {
+            runCatching {
+                if (targetPackage != null) {
+                    context.grantUriPermission(targetPackage, uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+                context.startActivity(Intent.createChooser(intent, chooserTitle))
+                AppLogger.i("Share", "Share document ${doc.id} target=${targetPackage ?: "system"} mime=${intent.type}")
+            }.onFailure { error ->
+                AppLogger.e("Share", "Unable to share to ${targetPackage ?: "system"}", error)
+                if (targetPackage != null) {
+                    Toast.makeText(context, localized(context, "Target app is unavailable. Opening system share.", "目标应用不可用，正在打开系统分享"), Toast.LENGTH_SHORT).show()
+                    shareFile(context, doc, targetPackage = null, chooserTitle = chooserTitle)
+                } else {
+                    Toast.makeText(context, localized(context, "No compatible sharing app found", "未找到可用的分享应用"), Toast.LENGTH_SHORT).show()
+                }
+            }
         }
     }
 }
 
 fun saveToGallery(context: Context, doc: Document) {
-    val file = File(doc.exportPath)
-    val values = ContentValues().apply {
-        put(MediaStore.MediaColumns.DISPLAY_NAME, file.name)
-        put(MediaStore.MediaColumns.MIME_TYPE, mimeTypeFor(doc.type))
-        put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOCUMENTS + "/ClearScan")
-    }
-    val uri = context.contentResolver.insert(MediaStore.Files.getContentUri("external"), values)
-    if (uri != null) {
-        context.contentResolver.openOutputStream(uri)?.use { out -> file.inputStream().use { it.copyTo(out) } }
-        Toast.makeText(context, localized(context, "Saved to Files", "已保存到文件"), Toast.LENGTH_SHORT).show()
+    kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
+        val file = runCatching { DocumentCrypto.decryptedCacheCopy(context, File(doc.exportPath)) }
+            .getOrElse {
+                AppLogger.e("Export", "Unable to prepare decrypted document for gallery export", it)
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(context, localized(context, "Unable to export document", "无法导出文档"), Toast.LENGTH_SHORT).show()
+                }
+                return@launch
+            }
+        val values = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, file.name)
+            put(MediaStore.MediaColumns.MIME_TYPE, mimeTypeFor(doc.type))
+            put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOCUMENTS + "/ClearScan")
+        }
+        val uri = context.contentResolver.insert(MediaStore.Files.getContentUri("external"), values)
+        if (uri != null) {
+            context.contentResolver.openOutputStream(uri)?.use { out -> file.inputStream().use { it.copyTo(out) } }
+            withContext(Dispatchers.Main) {
+                Toast.makeText(context, localized(context, "Saved to Files", "已保存到文件"), Toast.LENGTH_SHORT).show()
+            }
+        }
     }
 }
 

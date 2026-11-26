@@ -100,6 +100,7 @@ dependencies {
     testImplementation(libs.androidx.room.ktx)
     testImplementation(libs.androidx.test.core)
 
+    androidTestImplementation(libs.androidx.test.core)
     androidTestImplementation(libs.androidx.test.runner)
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation(libs.androidx.espresso.core)

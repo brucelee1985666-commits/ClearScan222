@@ -133,6 +133,9 @@ interface DocumentDao {
     @Query("SELECT * FROM draft_scan_pages WHERE sessionId = :sessionId ORDER BY pageIndex")
     suspend fun draftPages(sessionId: Long): List<DraftScanPageEntity>
 
+    @Query("SELECT * FROM draft_scan_pages")
+    suspend fun allDraftPages(): List<DraftScanPageEntity>
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertDraftPage(page: DraftScanPageEntity)
 
