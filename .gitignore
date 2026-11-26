@@ -32,7 +32,7 @@ keystore.properties
 
 # Downloaded AI models and partial downloads
 modelscope_hy_mt2/
-models/
+/models/
 *.gguf
 *.gguf.*
 *.part

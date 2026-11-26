@@ -18,7 +18,7 @@ ClearScan is a native Android scanner built with Kotlin and Jetpack Compose. It 
 | Alignment | OpenCV edge detection, confidence-based fallback, four-corner manual adjustment, high-resolution perspective correction |
 | Editing | Rotation, brightness, contrast, saturation, document enhancement, high-quality cached filter previews |
 | Filters | Auto, Clean, White Paper, B&W, Ink, Magic Color, Photo, Gray, Soft Gray, and High Contrast |
-| Documents | Local library, search, nested folders, rename, move, delete, share, print, and password protection |
+| Documents | Local library, search, nested folders, rename, move, delete, share, print, and encrypted private storage |
 | PDF tools | Image to PDF, PDF to image, merge, split, compress, page-level editing, watermark, and signature overlays |
 | Codes | Bundled ML Kit QR and barcode recognition, safe URL opening, copy, and web search actions |
 | Translation | Optional Hy-MT2 GGUF download and local inference through a llama.cpp Android runtime |
@@ -40,12 +40,16 @@ The Hy-MT2 model is not bundled in the APK. It is downloaded on first use from a
 
 Local translation currently requires an ARM64 device with enough free storage and memory for the approximately 1.1 GB Q4 model. Scanning, PDF tools, and document management do not require the translation model.
 
-## Privacy
+## Privacy and at-rest protection
 
-- Documents, page images, settings, logs, and downloaded models are stored locally.
-- ClearScan does not require a ClearScan cloud account.
-- Scanned documents are not uploaded to a ClearScan server.
-- Files leave the application only after an explicit share, export, link-opening, model-download, or update action.
+- Private document images and PDFs are encrypted with AES-256-GCM; the non-exportable AES key is held by Android Keystore.
+- Existing app-private documents are migrated in a one-time startup pass before the document library is shown; any missed legacy file is upgraded on first read or explicit export/share.
+- The previous password-lock UI was removed because it only stored raw passwords and did not encrypt files. Legacy plaintext password entries are purged from SharedPreferences and DataStore.
+- Android cloud backup and device-transfer backup are disabled for application data.
+- ClearScan does not require a ClearScan cloud account. The app code has no automatic photo/document upload endpoint.
+- A decrypted temporary copy is created only for explicit share/export actions; temporary staging files are cleaned on the next app start.
+- Translation model downloads and update checks use network access. Cleartext HTTP is blocked by Android network security configuration.
+- Runtime packet-capture testing is still required before making a claim that no unexpected traffic occurs on every supported device/network.
 - Application logs record operational metadata and errors, not copies of scanned page content.
 
 ## Compatibility

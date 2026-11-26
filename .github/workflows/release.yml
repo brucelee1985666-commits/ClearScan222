@@ -13,15 +13,24 @@ jobs:
     if: ${{ vars.RELEASE_SIGNING_CONFIGURED == 'true' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # actions/checkout v5
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # actions/setup-java v5
         with:
           distribution: temurin
           java-version: "17"
           cache: gradle
-      - uses: android-actions/setup-android@v3
+      - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # android-actions/setup-android v3
+        with:
+          packages: ''
       - name: Install NDK and CMake
-        run: sdkmanager "ndk;28.2.13676358" "cmake;3.31.6"
+        run: sdkmanager --install "platform-tools" "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358" "cmake;3.31.6"
+      - name: Verify Gradle Wrapper and dependency metadata
+        run: |
+          echo "55243ef57851f12b070ad14f7f5bb8302daceeebc5bce5ece5fa6edb23e1145c  gradle/wrapper/gradle-wrapper.jar" | sha256sum --check -
+          test -s gradle/verification-metadata.xml || { echo "Dependency verification metadata is required before release"; exit 1; }
+      - name: Check complete vendored llama.cpp model sources
+        run: |
+          test -s third_party/llama.cpp/src/models/models.h || { echo "Missing third_party/llama.cpp/src/models/models.h. Restore the matching llama.cpp model sources before producing a functional release."; exit 1; }
       - name: Restore release keystore
         env:
           KEYSTORE_BASE64: ${{ secrets.CLEARSCAN_KEYSTORE_BASE64 }}
@@ -32,7 +41,18 @@ jobs:
           CLEARSCAN_KEYSTORE_PASSWORD: ${{ secrets.CLEARSCAN_KEYSTORE_PASSWORD }}
           CLEARSCAN_KEY_ALIAS: ${{ secrets.CLEARSCAN_KEY_ALIAS }}
           CLEARSCAN_KEY_PASSWORD: ${{ secrets.CLEARSCAN_KEY_PASSWORD }}
-        run: ./gradlew testDownloadModelDebugUnitTest lintDownloadModelRelease assembleDownloadModelRelease
+        run: ./gradlew testDownloadModelDebugUnitTest lintDownloadModelRelease :app:assembleDownloadModelDebugAndroidTest assembleDownloadModelRelease
+      - name: Verify release APK signer
+        env:
+          EXPECTED_CERT_SHA256: ${{ vars.CLEARSCAN_SIGNING_CERT_SHA256 }}
+        run: |
+          APK="app/build/outputs/apk/downloadModel/release/app-downloadModel-release.apk"
+          test -s "$APK"
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose --print-certs "$APK"
+          ACTUAL_CERT_SHA256=$("$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --print-certs "$APK" | sed -n 's/.*certificate SHA-256 digest: //p' | head -n 1 | tr -d ':')
+          test -n "$EXPECTED_CERT_SHA256" || { echo "Set repository variable CLEARSCAN_SIGNING_CERT_SHA256 to the independently verified release certificate fingerprint"; exit 1; }
+          test "${ACTUAL_CERT_SHA256,,}" = "${EXPECTED_CERT_SHA256,,}" || { echo "Release certificate fingerprint mismatch"; exit 1; }
+          sha256sum "$APK"
       - name: Prepare release asset
         run: |
           cp app/build/outputs/apk/downloadModel/release/app-downloadModel-release.apk "ClearScan-${GITHUB_REF_NAME}-arm64-v8a.apk"

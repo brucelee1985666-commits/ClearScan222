@@ -2,6 +2,8 @@ plugins {
     alias(libs.plugins.android.library)
 }
 
+val skipLlamaNativeBuild = providers.gradleProperty("skipLlamaNativeBuild").orNull == "true"
+
 android {
     namespace = "com.arm.aichat"
     compileSdk = 36
@@ -17,32 +19,36 @@ android {
         ndk {
              abiFilters += listOf("arm64-v8a")
         }
-        externalNativeBuild {
-            cmake {
-                arguments += "-DCMAKE_BUILD_TYPE=Release"
-                arguments += "-DCMAKE_MESSAGE_LOG_LEVEL=DEBUG"
-                arguments += "-DCMAKE_VERBOSE_MAKEFILE=ON"
+        if (!skipLlamaNativeBuild) {
+            externalNativeBuild {
+                cmake {
+                    arguments += "-DCMAKE_BUILD_TYPE=Release"
+                    arguments += "-DCMAKE_MESSAGE_LOG_LEVEL=DEBUG"
+                    arguments += "-DCMAKE_VERBOSE_MAKEFILE=ON"
 
-                arguments += "-DBUILD_SHARED_LIBS=OFF"
-                arguments += "-DLLAMA_BUILD_APP=OFF"
-                arguments += "-DLLAMA_BUILD_COMMON=ON"
-                arguments += "-DLLAMA_OPENSSL=OFF"
+                    arguments += "-DBUILD_SHARED_LIBS=OFF"
+                    arguments += "-DLLAMA_BUILD_APP=OFF"
+                    arguments += "-DLLAMA_BUILD_COMMON=ON"
+                    arguments += "-DLLAMA_OPENSSL=OFF"
 
-                arguments += "-DGGML_NATIVE=OFF"
-                arguments += "-DGGML_BACKEND_DL=OFF"
-                arguments += "-DGGML_CPU_ALL_VARIANTS=OFF"
-                arguments += "-DGGML_CPU_ARM_ARCH=armv8-a"
-                arguments += "-DGGML_LLAMAFILE=OFF"
+                    arguments += "-DGGML_NATIVE=OFF"
+                    arguments += "-DGGML_BACKEND_DL=OFF"
+                    arguments += "-DGGML_CPU_ALL_VARIANTS=OFF"
+                    arguments += "-DGGML_CPU_ARM_ARCH=armv8-a"
+                    arguments += "-DGGML_LLAMAFILE=OFF"
+                }
             }
         }
         aarMetadata {
             minCompileSdk = 35
         }
     }
-    externalNativeBuild {
-        cmake {
-            path("src/main/cpp/CMakeLists.txt")
-            version = "3.31.6"
+    if (!skipLlamaNativeBuild) {
+        externalNativeBuild {
+            cmake {
+                path("src/main/cpp/CMakeLists.txt")
+                version = "3.31.6"
+            }
         }
     }
     compileOptions {
